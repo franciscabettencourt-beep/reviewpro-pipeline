@@ -169,7 +169,7 @@ elif page == "📂 Importar ficheiros":
         st.markdown("### 3. Guest Interaction Report")
         st.caption("Relatório das guest relations")
         gir_file = st.file_uploader(
-            "GIR", type=["xlsx", "xls", "csv"], key="gir_upload",
+            "GIR", type=["xlsx", "xls", "csv", "pdf"], key="gir_upload",
             label_visibility="collapsed"
         )
         if gir_file:
