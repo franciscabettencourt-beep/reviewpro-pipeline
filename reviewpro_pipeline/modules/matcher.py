@@ -16,10 +16,11 @@ from config.settings import (
     FUZZY_PROBABLE_THRESHOLD,
 )
 from modules.loader import _normalize_col
+from modules.mapper import _parse_date
 
 
 # Possíveis nomes de colunas no GIR para cada campo de matching
-GIR_NAME_ALIASES = ["guest name", "name", "nome", "first name", "firstname", "nome completo"]
+GIR_NAME_ALIASES = ["guest name", "guestname", "name", "guest", "nome", "nome completo", "hóspede", "hospede", "cliente"]
 GIR_FIRST_ALIASES = ["first name", "firstname", "first", "nome", "name first"]
 GIR_LAST_ALIASES = ["last name", "lastname", "last", "apelido", "surname"]
 GIR_DEPARTURE_ALIASES = ["departure date", "checkout date", "departure", "check out date", "data saida", "data saída"]
@@ -31,11 +32,18 @@ GIR_NOTES_ALIASES = ["notes", "notas", "comments", "comentários", "comentarios"
 
 def _find_gir_col(gir_df: pd.DataFrame, aliases: list):
     """Retorna nome da coluna no GIR que corresponde aos aliases, ou None."""
-    gir_cols = gir_df.columns.tolist()
+    gir_cols = [c for c in gir_df.columns.tolist() if not str(c).startswith("_")]
+    # 1ª passagem: correspondência exata
     for alias in aliases:
         norm = _normalize_col(alias)
         for col in gir_cols:
             if col == norm:
+                return col
+    # 2ª passagem: correspondência parcial (ex: "guest name (last, first)")
+    for alias in aliases:
+        norm = _normalize_col(alias)
+        for col in gir_cols:
+            if norm in col:
                 return col
     return None
 
@@ -90,6 +98,7 @@ def cross_with_gir(
     # Descobrir colunas do GIR
     gir_first_col = _find_gir_col(gir_df, GIR_FIRST_ALIASES)
     gir_last_col = _find_gir_col(gir_df, GIR_LAST_ALIASES)
+    gir_name_col = _find_gir_col(gir_df, GIR_NAME_ALIASES)
     gir_departure_col = _find_gir_col(gir_df, GIR_DEPARTURE_ALIASES)
     gir_room_col = _find_gir_col(gir_df, GIR_ROOM_ALIASES)
     gir_email_col = _find_gir_col(gir_df, GIR_EMAIL_ALIASES)
@@ -110,19 +119,38 @@ def cross_with_gir(
         )
 
     # Normalizar GIR para matching
+    gir_df = gir_df.copy()
     if gir_first_col and gir_last_col:
-        gir_df = gir_df.copy()
         gir_df["_full_name"] = (
             gir_df[gir_first_col].fillna("").astype(str).str.strip().str.lower()
             + " "
             + gir_df[gir_last_col].fillna("").astype(str).str.strip().str.lower()
         ).str.strip()
+    elif gir_name_col:
+        # Coluna única com o nome completo (ex: "Guest Name": "Smith, John").
+        # As vírgulas são removidas; o token_sort_ratio ignora a ordem dos nomes.
+        gir_df["_full_name"] = (
+            gir_df[gir_name_col].fillna("").astype(str)
+            .str.replace(",", " ", regex=False)
+            .str.lower()
+            .str.split().str.join(" ")
+        )
     elif gir_first_col:
-        gir_df = gir_df.copy()
         gir_df["_full_name"] = gir_df[gir_first_col].fillna("").astype(str).str.strip().str.lower()
     else:
-        gir_df = gir_df.copy()
         gir_df["_full_name"] = ""
+        available = ", ".join(str(c) for c in gir_df.columns if not str(c).startswith("_"))
+        warnings.append(
+            "Não foi encontrada nenhuma coluna de nome no GIR "
+            f"(colunas detetadas: {available}). Sem nome não é possível fazer "
+            "matching — todos os hóspedes serão tratados como 'sem match'."
+        )
+
+    # Normalizar a data de saída do GIR para DD/MM/AAAA (mesmo formato do VTRL)
+    if gir_departure_col:
+        gir_df["_dep_norm"] = (
+            gir_df[gir_departure_col].fillna("").astype(str).map(_parse_date)
+        )
 
     # Resultados
     eligible_rows = []
@@ -159,17 +187,17 @@ def cross_with_gir(
             name_score = fuzz.token_sort_ratio(vtrl_name, gir_name)
 
             if gir_departure_col:
-                gir_dep = str(gir_row.get(gir_departure_col, "")).strip()
-                # Normalizar datas para comparação simples
-                dep_match = (vtrl_departure == gir_dep) or (
-                    vtrl_departure[:10] == gir_dep[:10]
-                )
+                gir_dep = str(gir_row.get("_dep_norm", "")).strip()
+                # Ambas as datas já estão em DD/MM/AAAA; vazias não contam como match
+                dep_match = bool(vtrl_departure) and vtrl_departure == gir_dep
             else:
                 dep_match = True  # Sem coluna de data, não penalizar
 
             if gir_room_col:
                 gir_room = str(gir_row.get(gir_room_col, "")).strip().lower()
-                room_match = (vtrl_room == gir_room)
+                if gir_room.endswith(".0"):
+                    gir_room = gir_room[:-2]
+                room_match = bool(vtrl_room) and vtrl_room == gir_room
             else:
                 room_match = True
 
@@ -240,5 +268,31 @@ def cross_with_gir(
     excluded_df = to_df(excluded_rows)
     suspended_df = to_df(suspended_rows)
     no_match_df = to_df(no_match_rows)
+
+    # Diagnóstico: se nada teve match, mostrar como as colunas do GIR foram interpretadas
+    matched_total = len(eligible_rows) + len(excluded_rows) + len(suspended_rows)
+    if len(vtrl_df) > 0 and matched_total == 0:
+        if gir_first_col and gir_last_col:
+            name_desc = f"{gir_first_col} + {gir_last_col}"
+        else:
+            name_desc = gir_name_col or gir_first_col
+        detected = {
+            "nome": name_desc,
+            "data saída": gir_departure_col,
+            "quarto": gir_room_col,
+            "email": gir_email_col,
+            "notas": ", ".join(notes_cols) if notes_cols else None,
+        }
+        detected_str = "; ".join(f"{k}={v or '—'}" for k, v in detected.items())
+        available = ", ".join(
+            str(c) for c in gir_df.columns if not str(c).startswith("_")
+        )
+        warnings.append(
+            "Nenhum hóspede do VTRL teve correspondência no GIR. "
+            f"Interpretação das colunas do GIR: {detected_str}. "
+            f"Colunas disponíveis no GIR: {available}. "
+            "Se alguma coluna foi mal interpretada, ajusta os aliases GIR_* "
+            "no topo de modules/matcher.py."
+        )
 
     return eligible_df, excluded_df, suspended_df, no_match_df, warnings

@@ -59,6 +59,18 @@ SUSPENSION_KEYWORDS = [
     "contactar", "contact first",
 ]
 
+# Palavras-chave para reconhecer a linha de cabeçalho nas tabelas do GIR (PDF).
+# Uma linha que contenha pelo menos 2 destas palavras é tratada como cabeçalho.
+GIR_HEADER_KEYWORDS = [
+    "guest name", "guest", "name", "nome",
+    "room", "quarto",
+    "status", "estado",
+    "date", "data", "day",
+    "arrival", "departure", "chegada", "saida", "saída",
+    "interaction", "comment", "comentario", "comentário",
+    "notes", "notas", "issue", "reservation",
+]
+
 # Campos mínimos obrigatórios para o registo ser elegível
 REQUIRED_FIELDS = ["FIRST", "LAST", "DEPARTURE_DATE_TIME"]
 
