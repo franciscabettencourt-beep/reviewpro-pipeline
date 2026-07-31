@@ -7,6 +7,8 @@ Remove duplicados exatos.
 Valida estado CHECKED OUT.
 """
 
+import re
+
 import pandas as pd
 from dateutil import parser as date_parser
 from typing import Tuple, Dict, List
@@ -21,6 +23,19 @@ from config.settings import (
 from modules.loader import detect_column_match, _normalize_col
 
 
+# Abreviaturas de mês em português que o dateutil não reconhece
+_PT_MONTHS = {"fev": "Feb", "abr": "Apr", "mai": "May", "ago": "Aug",
+              "set": "Sep", "out": "Oct", "dez": "Dec"}
+
+
+def _translate_pt_months(value: str) -> str:
+    return re.sub(
+        r"(?i)\b(fev|abr|mai|ago|set|out|dez)\b",
+        lambda m: _PT_MONTHS[m.group(1).lower()],
+        value,
+    )
+
+
 def _parse_date(value: str) -> str:
     """
     Converte qualquer formato de data para DD/MM/AAAA.
@@ -30,7 +45,7 @@ def _parse_date(value: str) -> str:
     if not value or str(value).strip() in ("", "nan", "None", "NaT"):
         return ""
     try:
-        dt = date_parser.parse(str(value).strip(), dayfirst=True)
+        dt = date_parser.parse(_translate_pt_months(str(value).strip()), dayfirst=True)
         return dt.strftime("%d/%m/%Y")
     except Exception:
         try:

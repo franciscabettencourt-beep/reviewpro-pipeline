@@ -7,10 +7,14 @@ Retorna DataFrame com colunas normalizadas.
 
 import pandas as pd
 import io
+import re
 import pdfplumber
 from typing import Optional
 
 from config.settings import GIR_HEADER_KEYWORDS
+
+# Datas tipo "15-Jul-26" / "15-Set-2026" usadas como âncora de cada registo do GIR
+_ANCHOR_DATE_RE = re.compile(r"^\d{1,2}-[A-Za-zçÇ]{3,4}-\d{2,4}$")
 
 
 def _normalize_col(col: str) -> str:
@@ -158,12 +162,167 @@ def _table_from_words(page, headers=None, col_bounds=None):
     return headers, col_bounds, rows
 
 
+def _group_items_by_line(items, tol=2.0):
+    """Agrupa chars/words em linhas pela posição vertical (top)."""
+    lines = []
+    cur, cur_top = [], None
+    for it in sorted(items, key=lambda i: (i["top"], i["x0"])):
+        if cur_top is not None and abs(it["top"] - cur_top) > tol:
+            lines.append((cur_top, sorted(cur, key=lambda i: i["x0"])))
+            cur, cur_top = [], None
+        cur.append(it)
+        if cur_top is None:
+            cur_top = it["top"]
+    if cur:
+        lines.append((cur_top, sorted(cur, key=lambda i: i["x0"])))
+    return lines
+
+
+def _find_banded_labels(header_chars):
+    """
+    Localiza rótulos conhecidos no cabeçalho procurando na concatenação dos
+    caracteres (sem espaços) — necessário porque o cabeçalho destes exports
+    usa fonte minúscula com rótulos de várias linhas que saem baralhados.
+    Devolve dict {rotulo: x0} com os que encontrar.
+    """
+    targets = {
+        "guest": ["guestname", "guest", "nomedohóspede", "nomedohospede"],
+        "room": ["roomnumber", "roomno", "room", "quarto"],
+        "situ": ["situação", "situacao", "situaç", "descrição", "descricao"],
+        "tipo": ["tipodeinterac", "tipointerac"],
+    }
+    found = {}
+    for _, line in _group_items_by_line(header_chars, tol=1.2):
+        concat = ""
+        idx_to_x = []
+        for c in line:
+            for ch in c["text"]:
+                if ch.strip() == "":
+                    continue
+                concat += ch.lower()
+                idx_to_x.append(c["x0"])
+        for key, pats in targets.items():
+            if key in found:
+                continue
+            for pat in pats:
+                i = concat.find(pat)
+                if i >= 0:
+                    found[key] = idx_to_x[i]
+                    break
+    return found
+
+
+def _parse_banded_gir(pdf):
+    """
+    Parser dedicado ao GIR "Excel exportado para PDF": sem grelha de tabela,
+    mas com réguas horizontais (rects finos) a separar as filas. Cada registo
+    tem uma linha-âncora com a data do report na 1ª coluna; filas sem âncora
+    são continuações do registo anterior. Devolve lista de dicts ou None.
+    """
+    records = []
+    labels = None
+    for page in pdf.pages:
+        rules = sorted({
+            round((r["top"] + r["bottom"]) / 2, 1)
+            for r in page.rects
+            if (r["bottom"] - r["top"]) < 2.5 and (r["x1"] - r["x0"]) > page.width * 0.5
+        })
+        words = [w for w in page.extract_words() if w["text"].strip()]
+        if not words:
+            continue
+        if len(rules) >= 3:
+            hdr_chars = [c for c in page.chars if rules[0] <= c["top"] < rules[1]]
+            found = _find_banded_labels(hdr_chars)
+            if "guest" in found:
+                labels = found
+                bands = list(zip(rules[1:-1], rules[2:]))
+            elif labels is not None:
+                # página sem cabeçalho repetido: todas as réguas delimitam dados
+                bands = list(zip(rules[:-1], rules[1:]))
+            else:
+                return None
+        else:
+            if labels is None:
+                return None
+            continue
+
+        guest_x = labels["guest"]
+        room_x = labels.get("room", guest_x + 38)
+        situ_x = labels.get("situ")
+        tipo_x = labels.get("tipo")
+        data_words = [w for w in words if w["top"] >= bands[0][0]]
+        if not data_words:
+            continue
+        min_x = min(w["x0"] for w in data_words)
+
+        for y0, y1 in bands:
+            band_words = [w for w in words if y0 <= w["top"] < y1]
+            if not band_words:
+                continue
+            band_lines = _group_items_by_line(band_words)
+            anchor = None
+            for top, line in band_lines:
+                if any(_ANCHOR_DATE_RE.match(w["text"]) and w["x0"] <= min_x + 5 for w in line):
+                    anchor = line
+                    break
+            if anchor is None:
+                # Fila de continuação → juntar o texto ao registo anterior
+                if records:
+                    extra = " ".join(
+                        w["text"] for _, line in band_lines for w in line
+                        if situ_x is None or w["x0"] >= situ_x - 2
+                    )
+                    records[-1]["notas"] = (records[-1]["notas"] + " " + extra).strip()
+                continue
+
+            dates_sorted = sorted(
+                [w for w in anchor if _ANCHOR_DATE_RE.match(w["text"])],
+                key=lambda w: w["x0"],
+            )
+            checkin = dates_sorted[1]["text"] if len(dates_sorted) >= 2 else ""
+            if len(dates_sorted) >= 3:
+                checkout = dates_sorted[2]["text"]
+            elif len(dates_sorted) == 2:
+                checkout = dates_sorted[-1]["text"]
+            else:
+                checkout = ""
+            room_x1 = dates_sorted[1]["x0"] - 2 if len(dates_sorted) >= 2 else room_x + 17
+
+            name = " ".join(
+                w["text"] for _, line in band_lines for w in line
+                if guest_x - 2 <= w["x0"] < room_x - 2
+            )
+            room = " ".join(
+                w["text"] for _, line in band_lines for w in line
+                if room_x - 2 <= w["x0"] < room_x1
+            )
+            tipo = ""
+            if tipo_x is not None:
+                tipo = " ".join(
+                    w["text"] for w in anchor if tipo_x - 2 <= w["x0"] < tipo_x + 45
+                )
+            notas = " ".join(
+                w["text"] for _, line in band_lines for w in line
+                if situ_x is None or w["x0"] >= situ_x - 2
+            )
+            records.append({
+                "guest name": name.strip(),
+                "room number": room.strip(),
+                "data check-in": checkin,
+                "data check-out": checkout,
+                "tipo de interacção": tipo.strip(),
+                "notas": notas.strip(),
+            })
+    return records or None
+
+
 def load_pdf(uploaded_file) -> pd.DataFrame:
     """
     Lê um PDF com tabela (como o Guest Interaction Report).
-    1º tenta a extração de tabelas do pdfplumber (várias estratégias);
-    se o PDF não tiver tabela detetável, reconstrói as colunas a partir
-    das posições das palavras no texto.
+    1º tenta o parser dedicado ao formato "Excel exportado para PDF" (réguas
+    horizontais entre filas); depois a extração de tabelas do pdfplumber
+    (várias estratégias); por fim reconstrói as colunas a partir das posições
+    das palavras no texto.
     """
     headers = None
     rows = []
@@ -171,6 +330,12 @@ def load_pdf(uploaded_file) -> pd.DataFrame:
     first_page_text = ""
 
     with pdfplumber.open(uploaded_file) as pdf:
+        banded = _parse_banded_gir(pdf)
+        if banded:
+            df = pd.DataFrame(banded, dtype=str).fillna("")
+            df.columns = [_normalize_col(c) for c in df.columns]
+            return df
+
         for page_no, page in enumerate(pdf.pages):
             if page_no == 0:
                 first_page_text = page.extract_text() or ""

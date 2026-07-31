@@ -5,6 +5,8 @@ Classifica cada registo como: elegível, excluído, suspenso.
 Retorna DataFrames separados + relatório de exclusões.
 """
 
+import re
+
 import pandas as pd
 from rapidfuzz import fuzz
 from typing import Tuple, Dict, List
@@ -23,11 +25,17 @@ from modules.mapper import _parse_date
 GIR_NAME_ALIASES = ["guest name", "guestname", "name", "guest", "nome", "nome completo", "hóspede", "hospede", "cliente"]
 GIR_FIRST_ALIASES = ["first name", "firstname", "first", "nome", "name first"]
 GIR_LAST_ALIASES = ["last name", "lastname", "last", "apelido", "surname"]
-GIR_DEPARTURE_ALIASES = ["departure date", "checkout date", "departure", "check out date", "data saida", "data saída"]
+GIR_DEPARTURE_ALIASES = ["departure date", "checkout date", "departure", "check out date", "data saida", "data saída", "data check-out", "data check out", "check-out", "checkout"]
 GIR_ROOM_ALIASES = ["room", "room no", "room no.", "quarto", "room number"]
 GIR_EMAIL_ALIASES = ["email", "e-mail", "email address", "guest email"]
 GIR_RESERVATION_ALIASES = ["reservation", "reservation number", "confirmation", "confirmation number", "profile id", "res no", "booking"]
-GIR_NOTES_ALIASES = ["notes", "notas", "comments", "comentários", "comentarios", "observations", "observações", "status", "estado", "issue", "problema"]
+GIR_NOTES_ALIASES = [
+    "notes", "notas", "comments", "comentários", "comentarios",
+    "observations", "observações", "status", "estado", "issue", "problema",
+    "tipo de interacção", "tipo de interaccao", "tipo de interação",
+    "situação reportada & acção tomada", "situação", "situacao",
+    "follow up", "followup", "encerrado",
+]
 
 
 def _find_gir_col(gir_df: pd.DataFrame, aliases: list):
@@ -197,7 +205,15 @@ def cross_with_gir(
                 gir_room = str(gir_row.get(gir_room_col, "")).strip().lower()
                 if gir_room.endswith(".0"):
                     gir_room = gir_room[:-2]
-                room_match = bool(vtrl_room) and vtrl_room == gir_room
+                # O GIR pode ter vários quartos ("9007,9009,9107 (#3)") —
+                # basta o quarto do VTRL constar na lista
+                gir_rooms = set(re.findall(r"\d+", gir_room))
+                if gir_rooms:
+                    room_match = bool(vtrl_room) and (
+                        vtrl_room in gir_rooms or vtrl_room == gir_room
+                    )
+                else:
+                    room_match = bool(vtrl_room) and vtrl_room == gir_room
             else:
                 room_match = True
 
