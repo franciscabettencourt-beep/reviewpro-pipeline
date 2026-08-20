@@ -37,7 +37,10 @@ CHECKEDOUT_VALUES = [
 ]
 
 # Palavras-chave no GIR que causam EXCLUSÃO automática
+# "reclam" apanha todas as variantes: Reclamação, Reclamação durante a estadia,
+# reclamou, reclamaram, reclamações, reclamacao...
 EXCLUSION_KEYWORDS = [
+    "reclam", "complain", "queixa", "queixou", "insatisf",
     "reclamação", "reclamacao", "complaint", "complained",
     "incidente", "incident",
     "não enviar", "nao enviar", "do not send", "dns",

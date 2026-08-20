@@ -6,6 +6,7 @@ Retorna DataFrames separados + relatório de exclusões.
 """
 
 import re
+from datetime import datetime, timedelta
 
 import pandas as pd
 from rapidfuzz import fuzz
@@ -26,6 +27,8 @@ GIR_NAME_ALIASES = ["guest name", "guestname", "name", "guest", "nome", "nome co
 GIR_FIRST_ALIASES = ["first name", "firstname", "first", "nome", "name first"]
 GIR_LAST_ALIASES = ["last name", "lastname", "last", "apelido", "surname"]
 GIR_DEPARTURE_ALIASES = ["departure date", "checkout date", "departure", "check out date", "data saida", "data saída", "data check-out", "data check out", "check-out", "checkout"]
+GIR_CHECKIN_ALIASES = ["arrival date", "check in date", "checkin date", "data chegada", "data check-in", "data check in", "check-in", "arrival"]
+GIR_TIPO_ALIASES = ["tipo de interacção", "tipo de interaccao", "tipo de interação", "interaction type", "tipo"]
 GIR_ROOM_ALIASES = ["room", "room no", "room no.", "quarto", "room number"]
 GIR_EMAIL_ALIASES = ["email", "e-mail", "email address", "guest email"]
 GIR_RESERVATION_ALIASES = ["reservation", "reservation number", "confirmation", "confirmation number", "profile id", "res no", "booking"]
@@ -77,6 +80,44 @@ def _classify_gir_record(gir_row: pd.Series, notes_cols: list) -> str:
     return "ok"
 
 
+def _extract_rooms(room_cell: str, notes_text: str) -> set:
+    """
+    Extrai os números de quarto de um registo do GIR:
+    - do valor da coluna de quarto ("9107", "9007,9009,9107 (#3)")
+    - de listas de quartos no texto das notas ("9007,9009,9107")
+    Números soltos no meio do texto (preços, horas) NÃO contam — só listas.
+    """
+    rooms = set(re.findall(r"\d{3,4}", str(room_cell)))
+    for lst in re.findall(r"\d{3,4}(?:\s*[,;/]\s*\d{3,4})+", str(notes_text)):
+        rooms |= set(re.findall(r"\d{3,4}", lst))
+    return rooms
+
+
+def _date_in_stay(departure: str, checkin: str, checkout: str) -> bool:
+    """
+    O check-out do VTRL (DD/MM/AAAA) cai dentro da estadia do registo do GIR?
+    Tolerância de +1 dia após o check-out (late check-outs). Datas em falta
+    ou ilegíveis não bloqueiam o match (na dúvida, excluir — protege o GRI).
+    """
+    try:
+        dep = datetime.strptime(str(departure).strip(), "%d/%m/%Y")
+    except Exception:
+        return True
+    try:
+        lo = datetime.strptime(str(checkin).strip(), "%d/%m/%Y")
+        if dep < lo:
+            return False
+    except Exception:
+        pass
+    try:
+        hi = datetime.strptime(str(checkout).strip(), "%d/%m/%Y")
+        if dep > hi + timedelta(days=1):
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def _get_notes_text(gir_row: pd.Series, notes_cols: list) -> str:
     """Extrai texto de notas relevante do GIR para mostrar ao utilizador."""
     parts = []
@@ -108,6 +149,8 @@ def cross_with_gir(
     gir_last_col = _find_gir_col(gir_df, GIR_LAST_ALIASES)
     gir_name_col = _find_gir_col(gir_df, GIR_NAME_ALIASES)
     gir_departure_col = _find_gir_col(gir_df, GIR_DEPARTURE_ALIASES)
+    gir_checkin_col = _find_gir_col(gir_df, GIR_CHECKIN_ALIASES)
+    gir_tipo_col = _find_gir_col(gir_df, GIR_TIPO_ALIASES)
     gir_room_col = _find_gir_col(gir_df, GIR_ROOM_ALIASES)
     gir_email_col = _find_gir_col(gir_df, GIR_EMAIL_ALIASES)
     gir_res_col = _find_gir_col(gir_df, GIR_RESERVATION_ALIASES)
@@ -160,6 +203,41 @@ def cross_with_gir(
             gir_df[gir_departure_col].fillna("").astype(str).map(_parse_date)
         )
 
+    # ── Índice de QUARTOS com reclamação/suspensão ────────────────────────────
+    # Regra principal: se um quarto aparece num registo do GIR classificado como
+    # exclusão (ex.: Tipo de Interacção = "Reclamação..."), TODOS os hóspedes do
+    # VTRL desse quarto com datas compatíveis são excluídos — apanha os
+    # acompanhantes com apelidos diferentes e reclamações com vários quartos,
+    # que o matching por nome não consegue apanhar.
+    room_entries = []
+    for _, gir_row in gir_df.iterrows():
+        classification = _classify_gir_record(gir_row, notes_cols)
+        if classification == "ok":
+            continue
+        notes_text = _get_notes_text(gir_row, notes_cols)
+        room_cell = str(gir_row.get(gir_room_col, "")) if gir_room_col else ""
+        rooms = _extract_rooms(room_cell, notes_text)
+        if not rooms:
+            continue
+        checkin_norm = (
+            _parse_date(str(gir_row.get(gir_checkin_col, ""))) if gir_checkin_col else ""
+        )
+        tipo_val = str(gir_row.get(gir_tipo_col, "")).strip() if gir_tipo_col else ""
+        room_entries.append({
+            "rooms": rooms,
+            "checkin": checkin_norm,
+            "checkout": str(gir_row.get("_dep_norm", "")).strip(),
+            "status": classification,
+            "notes": notes_text,
+            "tipo": tipo_val,
+        })
+    if room_entries:
+        excl_rooms = sorted({r for e in room_entries if e["status"] == "excluded" for r in e["rooms"]})
+        if excl_rooms:
+            warnings.append(
+                f"Quartos com reclamação no GIR (exclusão automática): {', '.join(excl_rooms)}."
+            )
+
     # Resultados
     eligible_rows = []
     excluded_rows = []
@@ -175,6 +253,38 @@ def cross_with_gir(
         vtrl_departure = str(vtrl_row.get("DEPARTURE_DATE_TIME", "")).strip()
         vtrl_room = str(vtrl_row.get("ROOM", "")).strip().lower()
         vtrl_email = str(vtrl_row.get("PHONE_TYPE", "")).strip().lower()
+
+        # ── 1º: exclusão/suspensão por QUARTO (independente do nome) ──────────
+        room_hit = None
+        vtrl_room_digits = re.sub(r"\D", "", vtrl_room)
+        if vtrl_room_digits:
+            for entry in room_entries:
+                if vtrl_room_digits in entry["rooms"] and _date_in_stay(
+                    vtrl_departure, entry["checkin"], entry["checkout"]
+                ):
+                    if room_hit is None or entry["status"] == "excluded":
+                        room_hit = entry
+                    if entry["status"] == "excluded":
+                        break
+        if room_hit is not None:
+            row_out = vtrl_row.to_dict()
+            row_out["_match_type"] = "room"
+            row_out["_match_score"] = 100.0
+            row_out["_gir_notes"] = room_hit["notes"]
+            tipo_info = f" ({room_hit['tipo']})" if room_hit["tipo"] else ""
+            if room_hit["status"] == "excluded":
+                row_out["_status"] = "excluded"
+                row_out["_exclusion_reason"] = (
+                    f"Quarto {vtrl_room_digits} num registo de reclamação do GIR{tipo_info}"
+                )
+                excluded_rows.append(row_out)
+            else:
+                row_out["_status"] = "suspended"
+                row_out["_exclusion_reason"] = (
+                    f"Quarto {vtrl_room_digits} num registo com palavra-chave de suspensão no GIR{tipo_info}"
+                )
+                suspended_rows.append(row_out)
+            continue
 
         best_match_idx = None
         best_score = 0
