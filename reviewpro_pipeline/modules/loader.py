@@ -13,8 +13,10 @@ from typing import Optional
 
 from config.settings import GIR_HEADER_KEYWORDS
 
-# Datas tipo "15-Jul-26" / "15-Set-2026" usadas como âncora de cada registo do GIR
-_ANCHOR_DATE_RE = re.compile(r"^\d{1,2}-[A-Za-zçÇ]{3,4}-\d{2,4}$")
+# Datas tipo "15-Jul-26" / "15-Set-2026" usadas como âncora de cada registo do GIR.
+# Prefixo (sem $): nalguns exports a data vem colada à palavra seguinte
+# ("18-Aug-26Raquel") e é preciso reconhecê-la na mesma.
+_ANCHOR_DATE_RE = re.compile(r"\d{1,2}-[A-Za-zçÇ]{3,4}-\d{2,4}")
 
 
 def _normalize_col(col: str) -> str:
@@ -275,18 +277,20 @@ def _parse_banded_gir(pdf):
                     records[-1]["notas"] = (records[-1]["notas"] + " " + extra).strip()
                 continue
 
-            dates_sorted = sorted(
-                [w for w in anchor if _ANCHOR_DATE_RE.match(w["text"])],
-                key=lambda w: w["x0"],
-            )
-            checkin = dates_sorted[1]["text"] if len(dates_sorted) >= 2 else ""
-            if len(dates_sorted) >= 3:
-                checkout = dates_sorted[2]["text"]
-            elif len(dates_sorted) == 2:
-                checkout = dates_sorted[-1]["text"]
+            date_hits = []
+            for w in anchor:
+                m = _ANCHOR_DATE_RE.match(w["text"])
+                if m:
+                    date_hits.append((w["x0"], m.group(0)))
+            date_hits.sort()
+            checkin = date_hits[1][1] if len(date_hits) >= 2 else ""
+            if len(date_hits) >= 3:
+                checkout = date_hits[2][1]
+            elif len(date_hits) == 2:
+                checkout = date_hits[-1][1]
             else:
                 checkout = ""
-            room_x1 = dates_sorted[1]["x0"] - 2 if len(dates_sorted) >= 2 else room_x + 17
+            room_x1 = date_hits[1][0] - 2 if len(date_hits) >= 2 else room_x + 17
 
             name = " ".join(
                 w["text"] for _, line in band_lines for w in line
@@ -296,10 +300,13 @@ def _parse_banded_gir(pdf):
                 w["text"] for _, line in band_lines for w in line
                 if room_x - 2 <= w["x0"] < room_x1
             )
+            # Tipo de Interacção: juntar as linhas da célula (pode vir quebrada
+            # em várias linhas, ex: "Reclamação Durante a" / "estadia")
             tipo = ""
             if tipo_x is not None:
                 tipo = " ".join(
-                    w["text"] for w in anchor if tipo_x - 2 <= w["x0"] < tipo_x + 45
+                    w["text"] for _, line in band_lines for w in line
+                    if tipo_x - 2 <= w["x0"] < tipo_x + 45
                 )
             notas = " ".join(
                 w["text"] for _, line in band_lines for w in line
@@ -403,7 +410,21 @@ def load_pdf(uploaded_file) -> pd.DataFrame:
 
     # Remover linhas totalmente vazias
     df = df[df.apply(lambda r: any(str(v).strip() for v in r), axis=1)]
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
+
+    # Guarda anti-lixo: se os cabeçalhos extraídos não incluem nenhuma coluna
+    # de nome/quarto, a extração falhou — é melhor dar erro claro do que deixar
+    # passar dados errados (que fariam todos os hóspedes parecer elegíveis).
+    cols_join = " ".join(str(c) for c in df.columns).lower()
+    if not re.search(r"guest|name|nome|room|quarto", cols_join):
+        raise ValueError(
+            "A extração do PDF do GIR produziu colunas irreconhecíveis "
+            f"({', '.join(str(c)[:30] for c in df.columns[:8])}...). "
+            "Para não arriscar enviar questionários a quem reclamou, o ficheiro "
+            "foi rejeitado. Envia este PDF ao suporte/Claude para afinar o parser, "
+            "ou carrega o Excel original do relatório."
+        )
+    return df
 
 
 def _is_html_xls(uploaded_file) -> bool:

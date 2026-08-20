@@ -60,9 +60,19 @@ def _find_gir_col(gir_df: pd.DataFrame, aliases: list):
 
 
 def _contains_keyword(text: str, keywords: list) -> bool:
-    """Verifica se o texto contém alguma das palavras-chave (case-insensitive)."""
+    """
+    Verifica se o texto contém alguma das palavras-chave (case-insensitive).
+    Compara também a versão SEM espaços: nos PDFs do GIR, células com texto em
+    2 linhas saem com os caracteres espaçados ("R e c l am ação") e a palavra
+    só é encontrada depois de remover os espaços.
+    """
     text_lower = str(text).lower()
-    return any(kw.lower() in text_lower for kw in keywords)
+    text_despaced = text_lower.replace(" ", "")
+    for kw in keywords:
+        k = kw.lower()
+        if k in text_lower or k.replace(" ", "") in text_despaced:
+            return True
+    return False
 
 
 def _classify_gir_record(gir_row: pd.Series, notes_cols: list) -> str:
@@ -80,17 +90,23 @@ def _classify_gir_record(gir_row: pd.Series, notes_cols: list) -> str:
     return "ok"
 
 
+def _norm_room(r: str) -> str:
+    """Normaliza um número de quarto: remove zeros à esquerda ('0007' → '7')."""
+    stripped = str(r).lstrip("0")
+    return stripped if stripped else str(r)
+
+
 def _extract_rooms(room_cell: str, notes_text: str) -> set:
     """
     Extrai os números de quarto de um registo do GIR:
-    - do valor da coluna de quarto ("9107", "9007,9009,9107 (#3)")
+    - do valor da coluna de quarto ("9107", "9202/9203", "7" — Residences)
     - de listas de quartos no texto das notas ("9007,9009,9107")
     Números soltos no meio do texto (preços, horas) NÃO contam — só listas.
     """
-    rooms = set(re.findall(r"\d{3,4}", str(room_cell)))
+    rooms = {_norm_room(r) for r in re.findall(r"\d{1,4}", str(room_cell))}
     for lst in re.findall(r"\d{3,4}(?:\s*[,;/]\s*\d{3,4})+", str(notes_text)):
-        rooms |= set(re.findall(r"\d{3,4}", lst))
-    return rooms
+        rooms |= {_norm_room(r) for r in re.findall(r"\d{3,4}", lst)}
+    return {r for r in rooms if r and r != "0"}
 
 
 def _date_in_stay(departure: str, checkin: str, checkout: str) -> bool:
@@ -256,7 +272,9 @@ def cross_with_gir(
 
         # ── 1º: exclusão/suspensão por QUARTO (independente do nome) ──────────
         room_hit = None
-        vtrl_room_digits = re.sub(r"\D", "", vtrl_room)
+        vtrl_room_digits = _norm_room(re.sub(r"\D", "", vtrl_room))
+        if vtrl_room_digits == "0":
+            vtrl_room_digits = ""
         if vtrl_room_digits:
             for entry in room_entries:
                 if vtrl_room_digits in entry["rooms"] and _date_in_stay(
