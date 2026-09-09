@@ -1,0 +1,32 @@
+name: Vigia da ponte Lovable
+
+# De 15 em 15 minutos pergunta à app Lovable se há lotes pendentes, corre o
+# motor (o mesmo parser calibrado da app Streamlit) e devolve os resultados.
+# Sem os secrets BRIDGE_URL/BRIDGE_KEY o passo sai em silêncio.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: lovable-worker
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/requirements-worker.txt
+      - name: Dependências
+        run: pip install -q -r tools/requirements-worker.txt
+      - name: Processar lotes pendentes
+        env:
+          BRIDGE_URL: ${{ secrets.BRIDGE_URL }}
+          BRIDGE_KEY: ${{ secrets.BRIDGE_KEY }}
+        run: python tools/lovable_worker.py
