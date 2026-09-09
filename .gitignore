@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Dados de execuções (contêm dados pessoais de hóspedes — nunca commitar)
+history/
+outputs/
+
+# Segredos
+.streamlit/secrets.toml
+.env
