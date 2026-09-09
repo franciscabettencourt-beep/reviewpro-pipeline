@@ -10,6 +10,7 @@ import datetime
 import os
 import json
 
+from modules.auth import require_password
 from modules.loader import load_file, get_master_columns
 from modules.mapper import map_vtrl_to_master, validate_required_fields
 from modules.matcher import cross_with_gir
@@ -31,12 +32,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# A app trata dados pessoais de hóspedes — nada é servido sem password.
+require_password()
+
 # ─── Estado da sessão ─────────────────────────────────────────────────────────
 def init_state():
     defaults = {
         "master_df": None,
         "vtrl_df": None,
         "gir_df": None,
+        # Lotes multi-ficheiro: listas de (nome do ficheiro, DataFrame)
+        "vtrl_batches": [],
+        "gir_batches": [],
         "mapped_df": None,
         "eligible_df": None,
         "excluded_df": None,
@@ -96,8 +103,8 @@ if page == "📊 Dashboard":
         st.info("Ainda não foi processado nenhum lote hoje. Vai a **Importar ficheiros** para começar.")
         st.markdown("### Como funciona")
         st.markdown("""
-1. **Importar ficheiros** — carrega o Master, o VTRL das 14h e o Guest Interaction Report
-2. **Revisão de matches** — valida correspondências prováveis com o GIR
+1. **Importar ficheiros** — carrega o Master, os VTRL em atraso (vários dias de uma vez) e TODOS os Guest Interaction Reports do período
+2. **Revisão de matches** — valida correspondências prováveis com os GIR agregados
 3. **Revisão operacional** — as guest relations reveem casos suspensos e adicionam notas
 4. **Exportar** — gera Excel final, CSV e ficheiro para ReviewPro
         """)
@@ -150,54 +157,65 @@ elif page == "📂 Importar ficheiros":
                 st.error(str(e))
 
     with col2:
-        st.markdown("### 2. VTRL diário")
-        st.caption("Lote de check-outs do dia")
-        vtrl_file = st.file_uploader(
+        st.markdown("### 2. VTRL diários")
+        st.caption("Podes carregar vários dias de uma vez (ex.: 15 de agosto + 9 de setembro)")
+        vtrl_files = st.file_uploader(
             "VTRL", type=["xlsx", "xls", "csv"], key="vtrl_upload",
-            label_visibility="collapsed"
+            accept_multiple_files=True, label_visibility="collapsed"
         )
-        if vtrl_file:
+        vtrl_batches = []
+        for f in vtrl_files or []:
             try:
-                df = load_file(vtrl_file)
-                st.session_state.vtrl_df = df
-                st.success(f"✓ VTRL carregado — {len(df)} registos")
-                st.caption(f"Colunas: {', '.join(df.columns.tolist()[:6])}...")
+                df = load_file(f)
+                vtrl_batches.append((f.name, df))
             except ValueError as e:
-                st.error(str(e))
+                st.error(f"{f.name}: {e}")
+        st.session_state.vtrl_batches = vtrl_batches
+        if vtrl_batches:
+            total = sum(len(df) for _, df in vtrl_batches)
+            st.success(f"✓ {len(vtrl_batches)} VTRL(s) — {total} check-outs no total")
+            for name, df in vtrl_batches:
+                st.caption(f"• {name} — {len(df)} registos")
 
     with col3:
-        st.markdown("### 3. Guest Interaction Report")
-        st.caption("Relatório das guest relations")
-        gir_file = st.file_uploader(
+        st.markdown("### 3. Guest Interaction Reports")
+        st.caption("Carrega TODOS os GIR do período: uma reclamação registada dias antes da saída conta na mesma")
+        gir_files = st.file_uploader(
             "GIR", type=["xlsx", "xls", "csv", "pdf"], key="gir_upload",
-            label_visibility="collapsed"
+            accept_multiple_files=True, label_visibility="collapsed"
         )
-        if gir_file:
+        gir_batches = []
+        for f in gir_files or []:
             try:
-                df = load_file(gir_file)
-                st.session_state.gir_df = df
-                st.success(f"✓ GIR carregado — {len(df)} registos")
-                st.caption(f"Colunas: {', '.join(df.columns.tolist()[:6])}...")
+                df = load_file(f)
+                gir_batches.append((f.name, df))
             except ValueError as e:
-                st.error(str(e))
+                st.error(f"{f.name}: {e}")
+        st.session_state.gir_batches = gir_batches
+        if gir_batches:
+            total = sum(len(df) for _, df in gir_batches)
+            st.success(f"✓ {len(gir_batches)} GIR(s) — {total} interações agregadas")
+            for name, df in gir_batches:
+                st.caption(f"• {name} — {len(df)} registos")
 
     st.markdown("---")
 
-    # Pré-visualização do mapeamento
-    if st.session_state.vtrl_df is not None:
+    # Pré-visualização do primeiro VTRL
+    if st.session_state.vtrl_batches:
         st.markdown("### Pré-visualização do VTRL")
-        st.dataframe(st.session_state.vtrl_df.head(5), use_container_width=True)
+        st.dataframe(st.session_state.vtrl_batches[0][1].head(5), use_container_width=True)
 
     st.markdown("---")
 
     # Botão de processamento
-    can_process = (
-        st.session_state.vtrl_df is not None
-        and st.session_state.gir_df is not None
-    )
+    can_process = bool(st.session_state.vtrl_batches) and bool(st.session_state.gir_batches)
 
     if not can_process:
-        st.info("Carrega o VTRL e o GIR para poder processar. O Master é opcional mas recomendado.")
+        st.info(
+            "Carrega pelo menos um VTRL e um GIR para poder processar. "
+            "Quantos mais GIR do período carregares, mais reclamações a exclusão apanha. "
+            "O Master é opcional mas recomendado."
+        )
 
     if st.button(
         "▶ Processar lote",
@@ -206,14 +224,30 @@ elif page == "📂 Importar ficheiros":
         use_container_width=True,
     ):
         all_warnings = []
+        vtrl_batches = st.session_state.vtrl_batches
+        gir_batches = st.session_state.gir_batches
 
-        with st.spinner("A mapear colunas do VTRL..."):
+        # Cada VTRL é mapeado com as SUAS colunas (formatos podem variar entre
+        # exportações); só depois se agrega, com dedup entre ficheiros para o
+        # caso de o mesmo dia ser carregado duas vezes.
+        with st.spinner(f"A mapear colunas de {len(vtrl_batches)} VTRL(s)..."):
             try:
-                mapped_df, mapping_found, map_warnings = map_vtrl_to_master(
-                    st.session_state.vtrl_df
-                )
-                all_warnings.extend(map_warnings)
-                st.session_state.total_vtrl = len(st.session_state.vtrl_df)
+                mapped_parts = []
+                for name, df in vtrl_batches:
+                    part, mapping_found, map_warnings = map_vtrl_to_master(df)
+                    mapped_parts.append(part)
+                    for w in map_warnings:
+                        all_warnings.append(f"{name}: {w}")
+                mapped_df = pd.concat(mapped_parts, ignore_index=True)
+                before = len(mapped_df)
+                mapped_df = mapped_df.drop_duplicates().reset_index(drop=True)
+                inter_dupes = before - len(mapped_df)
+                if inter_dupes > 0:
+                    all_warnings.append(
+                        f"{inter_dupes} duplicado(s) removido(s) entre ficheiros VTRL "
+                        "(o mesmo dia carregado mais do que uma vez)."
+                    )
+                st.session_state.total_vtrl = sum(len(df) for _, df in vtrl_batches)
             except Exception as e:
                 st.error(f"Erro no mapeamento: {e}")
                 st.stop()
@@ -227,12 +261,26 @@ elif page == "📂 Importar ficheiros":
                 )
             st.session_state.valid_vtrl = len(valid_df)
 
-        with st.spinner("A cruzar com o Guest Interaction Report..."):
+        # TODOS os GIR entram num único índice: uma reclamação registada no GIR
+        # de dia 23 exclui o quarto mesmo que a saída seja a 27 — antes, com um
+        # só GIR de cada vez, esse e-mail passava.
+        with st.spinner(f"A agregar {len(gir_batches)} GIR(s) e a cruzar..."):
             try:
+                gir_all = pd.concat([df for _, df in gir_batches], ignore_index=True)
+                col_sets = {tuple(sorted(str(c) for c in df.columns)) for _, df in gir_batches}
+                if len(col_sets) > 1:
+                    all_warnings.append(
+                        "Os GIR carregados têm colunas diferentes entre si — confirma que "
+                        "são todos o mesmo tipo de relatório."
+                    )
                 eligible_df, excluded_df, suspended_df, no_match_df, match_warnings = cross_with_gir(
-                    valid_df, st.session_state.gir_df
+                    valid_df, gir_all
                 )
                 all_warnings.extend(match_warnings)
+                all_warnings.append(
+                    f"Lote agregado: {len(vtrl_batches)} VTRL(s) + {len(gir_batches)} GIR(s) "
+                    f"num único cruzamento."
+                )
             except Exception as e:
                 st.error(f"Erro no cruzamento com GIR: {e}")
                 st.stop()

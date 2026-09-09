@@ -8,6 +8,12 @@ Suporta EN, FR, DE, ES, PT.
 import streamlit as st
 import requests
 
+from modules.auth import require_password, get_secret
+
+require_password()
+
+ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
+
 SYSTEM_PROMPT = """You are the Director of Guest Relations at Vilalara Thalassa Resort, a Forbes Travel Guide Five-Star property on the Algarve coast of Portugal.
 
 Your role is to craft responses to guest reviews on behalf of the resort. Every response must reflect the following standards without exception:
@@ -66,6 +72,12 @@ REVIEW_TYPES = [
 
 st.title("✍️ Respostas a reviews")
 st.caption("Tom Forbes · Quiet luxury · Empático e luxuoso")
+if not ANTHROPIC_API_KEY:
+    st.warning(
+        "A chave da Claude ainda não está configurada. Na Streamlit Cloud: "
+        "Manage app → Settings → Secrets → acrescenta `ANTHROPIC_API_KEY = \"sk-ant-...\"`. "
+        "A chave cria-se em console.anthropic.com → API Keys."
+    )
 st.markdown("---")
 
 col_left, col_right = st.columns([1, 1], gap="large")
@@ -107,7 +119,7 @@ with col_left:
         "Gerar resposta",
         type="primary",
         use_container_width=True,
-        disabled=not review_text.strip(),
+        disabled=not review_text.strip() or not ANTHROPIC_API_KEY,
     )
 
 with col_right:
@@ -132,18 +144,25 @@ Guest review:
             try:
                 resp = requests.post(
                     "https://api.anthropic.com/v1/messages",
-                    headers={"Content-Type": "application/json"},
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    },
                     json={
-                        "model": "claude-sonnet-4-20250514",
+                        "model": "claude-sonnet-5",
                         "max_tokens": 1000,
                         "system": SYSTEM_PROMPT,
                         "messages": [{"role": "user", "content": user_prompt}],
                     },
-                    timeout=30,
+                    timeout=60,
                 )
                 data = resp.json()
                 if "content" in data and data["content"]:
                     st.session_state.generated_response = data["content"][0]["text"]
+                elif "error" in data:
+                    st.error(f"A API da Claude recusou o pedido: {data['error'].get('message', data['error'])}")
+                    st.session_state.generated_response = ""
                 else:
                     st.error("Não foi possível gerar resposta. Tenta novamente.")
                     st.session_state.generated_response = ""
